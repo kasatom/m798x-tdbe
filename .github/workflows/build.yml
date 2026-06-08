@@ -1,26 +1,15 @@
-name: Build OpenWrt with TUN Module - Smart Logging
+name: Build OpenWrt with TUN Module
 
 on:
   workflow_dispatch:
     inputs:
       debug_level:
-        description: 'Debug level (0=quiet, 1=normal, 2=verbose)'
+        description: 'Debug level'
         default: '1'
         type: choice
         options:
-        - '0'
-        - '1' 
+        - '1'
         - '2'
-
-env:
-  # Node.js兼容性修复
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-  # 资源限制
-  BUILD_THREADS: "2"
-  BUILD_MEMORY: "6144"
-  # 日志管理
-  MAX_LOG_SIZE: "10485760"  # 10MB
-  LOG_ROTATE_SIZE: "5242880"  # 5MB
 
 jobs:
   build:
@@ -47,250 +36,69 @@ jobs:
           zlib1g-dev gawk flex gettext wget unzip python3 python3-pip \
           python3-dev python3-setuptools libssl-dev rsync ccache ecj \
           fastjar binwalk file bsdmainutils jq moreutils
-        
-    - name: Configure build with TUN module
+    
+    - name: Configure TUN module
       run: |
-        echo "🔍 Configuring TUN module..."
-        
-        # 处理配置文件
+        echo "🔧 Configuring TUN module..."
         if [ -f .config ]; then
-          echo "✅ Found existing .config file"
+          echo "✅ Using existing .config file"
           cp .config .config.backup
         else
           echo "🔄 Creating default configuration"
           make defconfig
         fi
-        
-        # 启用关键模块
-        echo "🔧 Enabling TUN and tunnel modules..."
-        {
-          echo "CONFIG_PACKAGE_kmod-tun=y"
-          echo "CONFIG_PACKAGE_kmod-iptunnel=y" 
-          echo "CONFIG_PACKAGE_kmod-ip6-tunnel=y"
-          echo "CONFIG_PACKAGE_kmod-wireguard=y"
-          echo "CONFIG_KERNEL_TUN=y"
-        } >> .config
-        
-        # 验证配置
-        echo "✅ TUN module configuration:"
-        grep -E "kmod-tun|CONFIG_TUN|kmod-iptunnel|kmod-ip6-tunnel|CONFIG_KERNEL_TUN" .config || echo "⚠️ No TUN config found, will use make menuconfig"
-        
-        # 生成最终配置
+        echo "CONFIG_PACKAGE_kmod-tun=y" >> .config
+        echo "CONFIG_PACKAGE_kmod-iptunnel=y" >> .config
+        echo "CONFIG_PACKAGE_kmod-ip6-tunnel=y" >> .config
+        echo "CONFIG_PACKAGE_kmod-wireguard=y" >> .config
+        echo "CONFIG_KERNEL_TUN=y" >> .config
         make oldconfig
-        
-        echo "✅ Configuration completed successfully"
+        echo "✅ TUN module configuration completed"
     
-    - name: Build firmware with smart logging
+    - name: Build firmware
       id: build_step
       run: |
-        echo "🚀 Starting build with smart logging..."
-        
-        # 设置内存限制
-        ulimit -v $((BUILD_MEMORY * 1024))
-        
-        # 创建日志目录
+        echo "🚀 Starting build..."
+        ulimit -v 6291456  # 6GB memory limit
         mkdir -p build_logs
-        LOG_FILE="build_logs/build.log"
-        ERROR_LOG="build_logs/errors.log"
-        SUMMARY_LOG="build_logs/summary.log"
         
-        # 清理旧构建
-        echo "🧹 Cleaning previous build..."
-        make clean > /dev/null 2>&1 || true
-        
-        echo "⚙️ Build configuration:"
-        echo "- Threads: ${{ env.BUILD_THREADS }}"
-        echo "- Memory limit: ${{ env.BUILD_MEMORY }}MB"
-        echo "- Max log size: ${{ env.MAX_LOG_SIZE }} bytes"
-        echo "- Debug level: ${{ github.event.inputs.debug_level || '1' }}"
-        
-        # 根据调试级别设置编译参数
-        DEBUG_FLAG=""
-        if [ "${{ github.event.inputs.debug_level || '1' }}" = "0" ]; then
-          DEBUG_FLAG="V=s"
-        elif [ "${{ github.event.inputs.debug_level || '1' }}" = "1" ]; then
-          DEBUG_FLAG="V=s"
+        # Simple build command with error capture
+        set +e
+        if [ "${{ github.event.inputs.debug_level }}" = "1" ]; then
+          make -j2 V=s 2>&1 | tee build_logs/build.log
         else
-          DEBUG_FLAG="V=s"
+          make -j2 V=s 2>&1 | tee build_logs/build.log
         fi
-        
-        echo "🔨 Starting compilation..."
-        set +e  # 允许后续命令继续执行，即使前面失败
-        
-        # 智能日志记录
-        {
-          make -j${BUILD_THREADS} ${DEBUG_FLAG} 2>&1
-        } | tee >(grep -iE "error|fail|warning|fatal|tun|module" > "${ERROR_LOG}") | tee "${LOG_FILE}"
-        
-        BUILD_EXIT_CODE=${PIPESTATUS[0]}
+        BUILD_EXIT_CODE=$?
         set -e
         
-        # 生成摘要
-        echo "📊 Build summary:" > "${SUMMARY_LOG}"
-        echo "Exit code: ${BUILD_EXIT_CODE}" >> "${SUMMARY_LOG}"
-        echo "Timestamp: $(date)" >> "${SUMMARY_LOG}"
-        echo "Firmware files:" >> "${SUMMARY_LOG}"
-        find bin/targets/ -name "*.bin" -exec ls -la {} \; >> "${SUMMARY_LOG}" 2>/dev/null || echo "No firmware files found" >> "${SUMMARY_LOG}"
-        
-        # 检查关键错误
-        echo "🔍 Analyzing build results..."
-        if [ ${BUILD_EXIT_CODE} -ne 0 ]; then
-          echo "❌ BUILD FAILED with exit code ${BUILD_EXIT_CODE}" | tee -a "${SUMMARY_LOG}"
-          
-          # 提取关键错误信息
-          echo "🚨 KEY ERROR MESSAGES:" | tee -a "${SUMMARY_LOG}"
-          if [ -f "${ERROR_LOG}" ]; then
-            # 只显示最近100行错误，避免过大
-            tail -100 "${ERROR_LOG}" | grep -iE "error|fail|fatal" | head -20 | tee -a "${SUMMARY_LOG}"
-            
-            # 检查常见错误模式
-            if grep -qi "memory" "${ERROR_LOG}"; then
-              echo "💡 Potential memory issue detected" | tee -a "${SUMMARY_LOG}"
-            fi
-            if grep -qi "disk space" "${ERROR_LOG}"; then
-              echo "💡 Potential disk space issue detected" | tee -a "${SUMMARY_LOG}"
-            fi
-            if grep -qi "dependency" "${ERROR_LOG}"; then
-              echo "💡 Missing dependency detected" | tee -a "${SUMMARY_LOG}"
-            fi
-          else
-            echo "⚠️ No error log file found" | tee -a "${SUMMARY_LOG}"
-          fi
+        # Create simple error report
+        echo "Exit code: $BUILD_EXIT_CODE" > build_logs/summary.log
+        if [ $BUILD_EXIT_CODE -ne 0 ]; then
+          echo "❌ BUILD FAILED" >> build_logs/summary.log
+          grep -iE "error|fail|fatal" build_logs/build.log | head -20 > build_logs/errors.log
         else
-          echo "✅ BUILD SUCCEEDED" | tee -a "${SUMMARY_LOG}"
-          echo "🎉 TUN module verification:" | tee -a "${SUMMARY_LOG}"
-          
-          # 验证TUN模块
-          for firmware in bin/targets/*/*/*.bin; do
-            if [ -f "$firmware" ]; then
-              echo "🔍 Checking firmware: $(basename "$firmware")" | tee -a "${SUMMARY_LOG}"
-              if strings "$firmware" | grep -qi "CONFIG_TUN=y"; then
-                echo "✅ TUN module confirmed in $firmware" | tee -a "${SUMMARY_LOG}"
-              else
-                echo "⚠️ TUN module not found in $firmware (may be built-in)" | tee -a "${SUMMARY_LOG}"
-              fi
-            fi
-          done
+          echo "✅ BUILD SUCCEEDED" >> build_logs/summary.log
+          find bin/targets/ -name "*.bin" >> build_logs/summary.log 2>/dev/null || true
         fi
         
-        # 设置输出变量
-        echo "build_exit_code=${BUILD_EXIT_CODE}" >> $GITHUB_OUTPUT
-        
+        echo "build_exit_code=$BUILD_EXIT_CODE" >> $GITHUB_OUTPUT
         echo "✅ Build process completed"
     
-    - name: Process and compress logs
-      if: always()
-      run: |
-        echo "🗂️ Processing log files..."
-        
-        # 限制日志文件大小
-        LOG_DIR="build_logs"
-        
-        # 压缩大日志文件
-        if [ -f "${LOG_DIR}/build.log" ] && [ $(stat -c%s "${LOG_DIR}/build.log") -gt ${MAX_LOG_SIZE} ]; then
-          echo "⚠️ Build log exceeds ${MAX_LOG_SIZE} bytes, compressing and truncating..."
-          
-          # 保留最后1000行（通常包含关键错误）
-          tail -1000 "${LOG_DIR}/build.log" > "${LOG_DIR}/build_tail.log"
-          
-          # 压缩完整日志
-          gzip -9 "${LOG_DIR}/build.log"
-          
-          mv "${LOG_DIR}/build_tail.log" "${LOG_DIR}/build.log"
-        fi
-        
-        # 创建精简错误报告
-        ERROR_REPORT="build_logs/error_report.txt"
-        cat > "${ERROR_REPORT}" << EOF
-🚀 OpenWrt Build Error Report
-========================================
-Build Date: $(date)
-GitHub SHA: ${{ github.sha }}
-Exit Code: ${{ steps.build_step.outputs.build_exit_code }}
-TUN Module Enabled: Yes
-
-🔧 Key Configuration:
-- Threads: ${{ env.BUILD_THREADS }}
-- Memory Limit: ${{ env.BUILD_MEMORY }}MB
-- Debug Level: ${{ github.event.inputs.debug_level || '1' }}
-
-🚨 Critical Errors (Last 50 lines):
-EOF
-        
-        if [ -f "build_logs/errors.log" ]; then
-          tail -50 "build_logs/errors.log" >> "${ERROR_REPORT}"
-        else
-          echo "⚠️ No errors.log file found" >> "${ERROR_REPORT}"
-        fi
-        
-        echo "" >> "${ERROR_REPORT}"
-        echo "📋 Build Summary:" >> "${ERROR_REPORT}"
-        cat "build_logs/summary.log" >> "${ERROR_REPORT}"
-        
-        # 创建快速诊断信息
-        echo "" >> "${ERROR_REPORT}"
-        echo "⚡ Quick Diagnosis:" >> "${ERROR_REPORT}"
-        if [ ${{ steps.build_step.outputs.build_exit_code }} -ne 0 ]; then
-          echo "- Build failed with exit code ${{ steps.build_step.outputs.build_exit_code }}"
-          echo "- Check the error_report.txt for details"
-          echo "- Common issues: memory limits, missing dependencies, configuration errors"
-        else
-          echo "- Build succeeded!"
-          echo "- TUN module verification completed"
-          echo "- Firmware files are ready for download"
-        fi
-        
-        echo "✅ Log processing completed"
-    
-    - name: Upload critical artifacts
+    - name: Upload logs and artifacts
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: build-results-${{ github.sha }}
+        name: build-results
         path: |
-          build_logs/error_report.txt
           build_logs/summary.log
-          build_logs/build.log
           build_logs/errors.log
+          build_logs/build.log
           .config
-          .config.backup
-        retention-days: 7
     
-    - name: Upload firmware (only on success)
+    - name: Upload firmware
       if: steps.build_step.outputs.build_exit_code == '0'
       uses: actions/upload-artifact@v4
       with:
-        name: firmware-with-tun-${{ github.sha }}
-        path: |
-          bin/targets/*/*/*.bin
-          bin/targets/*/*/*.manifest
-        retention-days: 30
-    
-    - name: Final status report
-      if: always()
-      run: |
-        echo "🎯 BUILD FINAL STATUS REPORT"
-        echo "========================================"
-        
-        EXIT_CODE=${{ steps.build_step.outputs.build_exit_code }}
-        
-        if [ "$EXIT_CODE" -eq 0 ]; then
-          echo "✅ SUCCESS: Build completed successfully!"
-          echo "🎉 TUN module is enabled and verified"
-          echo "📦 Firmware artifacts uploaded as 'firmware-with-tun-${{ github.sha }}'"
-        else
-          echo "❌ FAILED: Build failed with exit code $EXIT_CODE"
-          echo "🚨 Critical error report available in 'build-results-${{ github.sha }}'"
-          echo "📋 Download the error_report.txt file for detailed analysis"
-          echo "💡 Common fixes:"
-          echo "   - Increase memory limit (BUILD_MEMORY)"
-          echo "   - Reduce thread count (BUILD_THREADS)"
-          echo "   - Check dependency installation"
-          echo "   - Try debug level 0 for minimal logging"
-        fi
-        
-        echo "========================================"
-        echo "🔧 To retry with different settings:"
-        echo "   - Use debug_level 0 for minimal output"
-        echo "   - Use debug_level 2 for full debugging"
-        echo "   - Adjust resource limits in the workflow file"
+        name: firmware
+        path: bin/targets/*/*/*.bin
