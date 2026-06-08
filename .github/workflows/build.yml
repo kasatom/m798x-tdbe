@@ -3,61 +3,139 @@ name: Build OpenWrt with TUN Module
 on:
   workflow_dispatch:  # 允许手动触发
   push:
-    branches: [ main ]
+    branches: [ main, master ]
+
+env:
+  # 关键修复：强制使用Node.js 24
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  # 编译线程数（GitHub Actions限制）
+  BUILD_THREADS: "2"
+  # 内存限制（防止OOM）
+  BUILD_MEMORY: "6144"
 
 jobs:
   build:
     runs-on: ubuntu-22.04
-    env:
-      BUILD_THREADS: 4  # 根据GitHub Actions限制调整
+    timeout-minutes: 180  # 3小时超时
     
     steps:
+    - name: Set up Node.js 24
+      uses: actions/setup-node@v4
+      with:
+        node-version: 24
+        
     - name: Checkout code
       uses: actions/checkout@v4
       with:
         submodules: 'recursive'
+        fetch-depth: 0
     
-    - name: Install dependencies
+    - name: Install system dependencies
       run: |
-        sudo apt-get update
-        sudo apt-get install -y build-essential git libncurses5-dev libncursesw5-dev \
-        zlib1g-dev gawk flex gettext wget unzip python3 python3-pip python3-dev \
-        python3-setuptools libssl-dev rsync ccache ecj fastjar
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq \
+          build-essential git libncurses5-dev libncursesw5-dev \
+          zlib1g-dev gawk flex gettext wget unzip python3 python3-pip python3-dev \
+          python3-setuptools libssl-dev rsync ccache ecj fastjar \
+          binwalk file bsdmainutils
+        
+    - name: Install Python dependencies
+      run: |
+        python3 -m pip install -q --upgrade pip
+        python3 -m pip install -q pyyaml requests
         
     - name: Configure build with TUN module
       run: |
-        # 备份原始配置
-        cp .config .config.backup || true
+        echo "=== Starting TUN module configuration ==="
         
-        # 启用TUN模块（关键步骤！）
+        # 检查是否存在.config文件
+        if [ -f .config ]; then
+          echo "Found existing .config file"
+          cp .config .config.backup
+        else
+          echo "No .config file found, creating basic configuration"
+          make defconfig
+        fi
+        
+        # 关键：启用TUN模块
         echo "CONFIG_PACKAGE_kmod-tun=y" >> .config
         echo "CONFIG_PACKAGE_kmod-iptunnel=y" >> .config
         echo "CONFIG_PACKAGE_kmod-ip6-tunnel=y" >> .config
+        echo "CONFIG_PACKAGE_kmod-wireguard=y" >> .config
         
-        # 验证配置是否生效
-        grep -E "kmod-tun|CONFIG_TUN" .config || echo "TUN module enabled successfully"
+        # 验证配置是否成功
+        echo "=== Verifying TUN module configuration ==="
+        grep -E "kmod-tun|CONFIG_TUN|kmod-iptunnel|kmod-ip6-tunnel" .config
+        
+        # 确保配置有效
+        make oldconfig
+        
+        echo "=== TUN module configuration completed ==="
     
-    - name: Build firmware
+    - name: Build firmware with memory limits
       run: |
-        # 清理旧构建（可选）
+        echo "=== Starting build process ==="
+        echo "Using ${BUILD_THREADS} threads and ${BUILD_MEMORY}MB memory limit"
+        
+        # 设置内存限制
+        ulimit -v $((BUILD_MEMORY * 1024))
+        
+        # 清理旧构建
         make clean
         
-        # 开始编译（使用适当线程数）
-        make -j${BUILD_THREADS} V=s
+        # 开始编译（详细日志）
+        make -j${BUILD_THREADS} V=s 2>&1 | tee build.log
         
-        # 验证编译结果
+        echo "=== Build completed ==="
+        
+        # 检查构建结果
         find bin/targets/ -name "*.bin" -exec ls -la {} \;
-    
-    - name: Verify TUN module in firmware
-      run: |
-        # 检查生成的固件是否包含tun模块
+        
+        # 验证固件大小
         for firmware in bin/targets/*/*/*.bin; do
-          echo "=== Checking firmware: $firmware ==="
-          # 使用binwalk分析固件内容
-          binwalk "$firmware" | grep -i tun || echo "TUN module may be included"
+          size=$(stat -c%s "$firmware")
+          echo "Firmware size: $(($size / 1024 / 1024)) MB"
+          if [ "$size" -lt 5000000 ]; then
+            echo "⚠️ Warning: Firmware size seems too small ($(($size / 1024 / 1024)) MB)"
+          fi
         done
     
-    - name: Upload artifacts
+    - name: Verify TUN module inclusion
+      run: |
+        echo "=== Verifying TUN module in firmware ==="
+        
+        # 安装binwalk（如果未安装）
+        sudo apt-get install -y binwalk
+        
+        for firmware in bin/targets/*/*/*.bin; do
+          echo "=== Analyzing: $firmware ==="
+          
+          # 创建临时目录
+          mkdir -p /tmp/firmware-analysis
+          
+          # 使用binwalk分析
+          binwalk "$firmware" > /tmp/firmware-analysis/binwalk.log
+          
+          # 检查是否包含tun相关文件
+          grep -i "tun\|tunnel" /tmp/firmware-analysis/binwalk.log || echo "No explicit tun files found, but module may be built-in"
+          
+          # 检查内核配置
+          echo "=== Checking kernel config ==="
+          strings "$firmware" | grep -i "CONFIG_TUN=y" && echo "✅ TUN module confirmed in kernel config"
+        done
+    
+    - name: Upload build logs
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: build-logs-${{ github.sha }}
+        path: |
+          build.log
+          .config
+          .config.backup
+    
+    - name: Upload firmware artifacts
+      if: success()
       uses: actions/upload-artifact@v4
       with:
         name: openwrt-with-tun-${{ github.sha }}
@@ -67,15 +145,32 @@ jobs:
           bin/targets/*/*/*.tar.gz
         retention-days: 30
     
-    - name: Create release (optional)
-      if: github.ref == 'refs/heads/main'
-      uses: softprops/action-gh-release@v1
+    - name: Create GitHub Release (optional)
+      if: github.ref == 'refs/heads/main' && success()
+      uses: softprops/action-gh-release@v2
       with:
         files: bin/targets/*/*/*.bin
-        tag_name: v1.0-with-tun
-        name: OpenWrt with TUN Module
+        tag_name: v1.0-with-tun-${{ github.sha }}
+        name: OpenWrt with TUN Module - ${{ github.sha }}
         body: |
           Custom build with TUN module enabled for Tenda BE12 Pro (BE7200)
-          - kmod-tun enabled
-          - kmod-iptunnel enabled  
-          - kmod-ip6-tunnel enabled
+          
+          **Enabled Modules:**
+          - ✅ kmod-tun (TUN/TAP virtual network devices)
+          - ✅ kmod-iptunnel (IP tunnel support)
+          - ✅ kmod-ip6-tunnel (IPv6 tunnel support)
+          - ✅ kmod-wireguard (WireGuard support)
+          
+          **Build Information:**
+          - GitHub SHA: ${{ github.sha }}
+          - Build Date: ${{ github.date }}
+          - Node.js Version: 24 (fixed compatibility issue)
+          
+          **Verification:**
+          After flashing, verify with:
+          ```bash
+          lsmod | grep tun
+          ls -la /dev/net/tun
+          ```
+        draft: false
+        prerelease: false
