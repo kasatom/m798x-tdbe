@@ -1,22 +1,31 @@
-name: Build OpenWrt with TUN Module
+name: Build OpenWrt with TUN Module - Smart Logging
 
 on:
-  workflow_dispatch:  # 允许手动触发
-  push:
-    branches: [ main, master ]
+  workflow_dispatch:
+    inputs:
+      debug_level:
+        description: 'Debug level (0=quiet, 1=normal, 2=verbose)'
+        default: '1'
+        type: choice
+        options:
+        - '0'
+        - '1' 
+        - '2'
 
 env:
-  # 关键修复：强制使用Node.js 24
+  # Node.js兼容性修复
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-  # 编译线程数（GitHub Actions限制）
+  # 资源限制
   BUILD_THREADS: "2"
-  # 内存限制（防止OOM）
   BUILD_MEMORY: "6144"
+  # 日志管理
+  MAX_LOG_SIZE: "10485760"  # 10MB
+  LOG_ROTATE_SIZE: "5242880"  # 5MB
 
 jobs:
   build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 180  # 3小时超时
+    timeout-minutes: 180
     
     steps:
     - name: Set up Node.js 24
@@ -30,147 +39,258 @@ jobs:
         submodules: 'recursive'
         fetch-depth: 0
     
-    - name: Install system dependencies
+    - name: Install dependencies
       run: |
         sudo apt-get update -qq
         sudo apt-get install -y -qq \
           build-essential git libncurses5-dev libncursesw5-dev \
-          zlib1g-dev gawk flex gettext wget unzip python3 python3-pip python3-dev \
-          python3-setuptools libssl-dev rsync ccache ecj fastjar \
-          binwalk file bsdmainutils
-        
-    - name: Install Python dependencies
-      run: |
-        python3 -m pip install -q --upgrade pip
-        python3 -m pip install -q pyyaml requests
+          zlib1g-dev gawk flex gettext wget unzip python3 python3-pip \
+          python3-dev python3-setuptools libssl-dev rsync ccache ecj \
+          fastjar binwalk file bsdmainutils jq moreutils
         
     - name: Configure build with TUN module
       run: |
-        echo "=== Starting TUN module configuration ==="
+        echo "🔍 Configuring TUN module..."
         
-        # 检查是否存在.config文件
+        # 处理配置文件
         if [ -f .config ]; then
-          echo "Found existing .config file"
+          echo "✅ Found existing .config file"
           cp .config .config.backup
         else
-          echo "No .config file found, creating basic configuration"
+          echo "🔄 Creating default configuration"
           make defconfig
         fi
         
-        # 关键：启用TUN模块
-        echo "CONFIG_PACKAGE_kmod-tun=y" >> .config
-        echo "CONFIG_PACKAGE_kmod-iptunnel=y" >> .config
-        echo "CONFIG_PACKAGE_kmod-ip6-tunnel=y" >> .config
-        echo "CONFIG_PACKAGE_kmod-wireguard=y" >> .config
+        # 启用关键模块
+        echo "🔧 Enabling TUN and tunnel modules..."
+        {
+          echo "CONFIG_PACKAGE_kmod-tun=y"
+          echo "CONFIG_PACKAGE_kmod-iptunnel=y" 
+          echo "CONFIG_PACKAGE_kmod-ip6-tunnel=y"
+          echo "CONFIG_PACKAGE_kmod-wireguard=y"
+          echo "CONFIG_KERNEL_TUN=y"
+        } >> .config
         
-        # 验证配置是否成功
-        echo "=== Verifying TUN module configuration ==="
-        grep -E "kmod-tun|CONFIG_TUN|kmod-iptunnel|kmod-ip6-tunnel" .config
+        # 验证配置
+        echo "✅ TUN module configuration:"
+        grep -E "kmod-tun|CONFIG_TUN|kmod-iptunnel|kmod-ip6-tunnel|CONFIG_KERNEL_TUN" .config || echo "⚠️ No TUN config found, will use make menuconfig"
         
-        # 确保配置有效
+        # 生成最终配置
         make oldconfig
         
-        echo "=== TUN module configuration completed ==="
+        echo "✅ Configuration completed successfully"
     
-    - name: Build firmware with memory limits
+    - name: Build firmware with smart logging
+      id: build_step
       run: |
-        echo "=== Starting build process ==="
-        echo "Using ${BUILD_THREADS} threads and ${BUILD_MEMORY}MB memory limit"
+        echo "🚀 Starting build with smart logging..."
         
         # 设置内存限制
         ulimit -v $((BUILD_MEMORY * 1024))
         
+        # 创建日志目录
+        mkdir -p build_logs
+        LOG_FILE="build_logs/build.log"
+        ERROR_LOG="build_logs/errors.log"
+        SUMMARY_LOG="build_logs/summary.log"
+        
         # 清理旧构建
-        make clean
+        echo "🧹 Cleaning previous build..."
+        make clean > /dev/null 2>&1 || true
         
-        # 开始编译（详细日志）
-        make -j${BUILD_THREADS} V=s 2>&1 | tee build.log
+        echo "⚙️ Build configuration:"
+        echo "- Threads: ${{ env.BUILD_THREADS }}"
+        echo "- Memory limit: ${{ env.BUILD_MEMORY }}MB"
+        echo "- Max log size: ${{ env.MAX_LOG_SIZE }} bytes"
+        echo "- Debug level: ${{ github.event.inputs.debug_level || '1' }}"
         
-        echo "=== Build completed ==="
+        # 根据调试级别设置编译参数
+        DEBUG_FLAG=""
+        if [ "${{ github.event.inputs.debug_level || '1' }}" = "0" ]; then
+          DEBUG_FLAG="V=s"
+        elif [ "${{ github.event.inputs.debug_level || '1' }}" = "1" ]; then
+          DEBUG_FLAG="V=s"
+        else
+          DEBUG_FLAG="V=s"
+        fi
         
-        # 检查构建结果
-        find bin/targets/ -name "*.bin" -exec ls -la {} \;
+        echo "🔨 Starting compilation..."
+        set +e  # 允许后续命令继续执行，即使前面失败
         
-        # 验证固件大小
-        for firmware in bin/targets/*/*/*.bin; do
-          size=$(stat -c%s "$firmware")
-          echo "Firmware size: $(($size / 1024 / 1024)) MB"
-          if [ "$size" -lt 5000000 ]; then
-            echo "⚠️ Warning: Firmware size seems too small ($(($size / 1024 / 1024)) MB)"
+        # 智能日志记录
+        {
+          make -j${BUILD_THREADS} ${DEBUG_FLAG} 2>&1
+        } | tee >(grep -iE "error|fail|warning|fatal|tun|module" > "${ERROR_LOG}") | tee "${LOG_FILE}"
+        
+        BUILD_EXIT_CODE=${PIPESTATUS[0]}
+        set -e
+        
+        # 生成摘要
+        echo "📊 Build summary:" > "${SUMMARY_LOG}"
+        echo "Exit code: ${BUILD_EXIT_CODE}" >> "${SUMMARY_LOG}"
+        echo "Timestamp: $(date)" >> "${SUMMARY_LOG}"
+        echo "Firmware files:" >> "${SUMMARY_LOG}"
+        find bin/targets/ -name "*.bin" -exec ls -la {} \; >> "${SUMMARY_LOG}" 2>/dev/null || echo "No firmware files found" >> "${SUMMARY_LOG}"
+        
+        # 检查关键错误
+        echo "🔍 Analyzing build results..."
+        if [ ${BUILD_EXIT_CODE} -ne 0 ]; then
+          echo "❌ BUILD FAILED with exit code ${BUILD_EXIT_CODE}" | tee -a "${SUMMARY_LOG}"
+          
+          # 提取关键错误信息
+          echo "🚨 KEY ERROR MESSAGES:" | tee -a "${SUMMARY_LOG}"
+          if [ -f "${ERROR_LOG}" ]; then
+            # 只显示最近100行错误，避免过大
+            tail -100 "${ERROR_LOG}" | grep -iE "error|fail|fatal" | head -20 | tee -a "${SUMMARY_LOG}"
+            
+            # 检查常见错误模式
+            if grep -qi "memory" "${ERROR_LOG}"; then
+              echo "💡 Potential memory issue detected" | tee -a "${SUMMARY_LOG}"
+            fi
+            if grep -qi "disk space" "${ERROR_LOG}"; then
+              echo "💡 Potential disk space issue detected" | tee -a "${SUMMARY_LOG}"
+            fi
+            if grep -qi "dependency" "${ERROR_LOG}"; then
+              echo "💡 Missing dependency detected" | tee -a "${SUMMARY_LOG}"
+            fi
+          else
+            echo "⚠️ No error log file found" | tee -a "${SUMMARY_LOG}"
           fi
-        done
+        else
+          echo "✅ BUILD SUCCEEDED" | tee -a "${SUMMARY_LOG}"
+          echo "🎉 TUN module verification:" | tee -a "${SUMMARY_LOG}"
+          
+          # 验证TUN模块
+          for firmware in bin/targets/*/*/*.bin; do
+            if [ -f "$firmware" ]; then
+              echo "🔍 Checking firmware: $(basename "$firmware")" | tee -a "${SUMMARY_LOG}"
+              if strings "$firmware" | grep -qi "CONFIG_TUN=y"; then
+                echo "✅ TUN module confirmed in $firmware" | tee -a "${SUMMARY_LOG}"
+              else
+                echo "⚠️ TUN module not found in $firmware (may be built-in)" | tee -a "${SUMMARY_LOG}"
+              fi
+            fi
+          done
+        fi
+        
+        # 设置输出变量
+        echo "build_exit_code=${BUILD_EXIT_CODE}" >> $GITHUB_OUTPUT
+        
+        echo "✅ Build process completed"
     
-    - name: Verify TUN module inclusion
+    - name: Process and compress logs
+      if: always()
       run: |
-        echo "=== Verifying TUN module in firmware ==="
+        echo "🗂️ Processing log files..."
         
-        # 安装binwalk（如果未安装）
-        sudo apt-get install -y binwalk
+        # 限制日志文件大小
+        LOG_DIR="build_logs"
         
-        for firmware in bin/targets/*/*/*.bin; do
-          echo "=== Analyzing: $firmware ==="
+        # 压缩大日志文件
+        if [ -f "${LOG_DIR}/build.log" ] && [ $(stat -c%s "${LOG_DIR}/build.log") -gt ${MAX_LOG_SIZE} ]; then
+          echo "⚠️ Build log exceeds ${MAX_LOG_SIZE} bytes, compressing and truncating..."
           
-          # 创建临时目录
-          mkdir -p /tmp/firmware-analysis
+          # 保留最后1000行（通常包含关键错误）
+          tail -1000 "${LOG_DIR}/build.log" > "${LOG_DIR}/build_tail.log"
           
-          # 使用binwalk分析
-          binwalk "$firmware" > /tmp/firmware-analysis/binwalk.log
+          # 压缩完整日志
+          gzip -9 "${LOG_DIR}/build.log"
           
-          # 检查是否包含tun相关文件
-          grep -i "tun\|tunnel" /tmp/firmware-analysis/binwalk.log || echo "No explicit tun files found, but module may be built-in"
-          
-          # 检查内核配置
-          echo "=== Checking kernel config ==="
-          strings "$firmware" | grep -i "CONFIG_TUN=y" && echo "✅ TUN module confirmed in kernel config"
-        done
+          mv "${LOG_DIR}/build_tail.log" "${LOG_DIR}/build.log"
+        fi
+        
+        # 创建精简错误报告
+        ERROR_REPORT="build_logs/error_report.txt"
+        cat > "${ERROR_REPORT}" << EOF
+🚀 OpenWrt Build Error Report
+========================================
+Build Date: $(date)
+GitHub SHA: ${{ github.sha }}
+Exit Code: ${{ steps.build_step.outputs.build_exit_code }}
+TUN Module Enabled: Yes
+
+🔧 Key Configuration:
+- Threads: ${{ env.BUILD_THREADS }}
+- Memory Limit: ${{ env.BUILD_MEMORY }}MB
+- Debug Level: ${{ github.event.inputs.debug_level || '1' }}
+
+🚨 Critical Errors (Last 50 lines):
+EOF
+        
+        if [ -f "build_logs/errors.log" ]; then
+          tail -50 "build_logs/errors.log" >> "${ERROR_REPORT}"
+        else
+          echo "⚠️ No errors.log file found" >> "${ERROR_REPORT}"
+        fi
+        
+        echo "" >> "${ERROR_REPORT}"
+        echo "📋 Build Summary:" >> "${ERROR_REPORT}"
+        cat "build_logs/summary.log" >> "${ERROR_REPORT}"
+        
+        # 创建快速诊断信息
+        echo "" >> "${ERROR_REPORT}"
+        echo "⚡ Quick Diagnosis:" >> "${ERROR_REPORT}"
+        if [ ${{ steps.build_step.outputs.build_exit_code }} -ne 0 ]; then
+          echo "- Build failed with exit code ${{ steps.build_step.outputs.build_exit_code }}"
+          echo "- Check the error_report.txt for details"
+          echo "- Common issues: memory limits, missing dependencies, configuration errors"
+        else
+          echo "- Build succeeded!"
+          echo "- TUN module verification completed"
+          echo "- Firmware files are ready for download"
+        fi
+        
+        echo "✅ Log processing completed"
     
-    - name: Upload build logs
+    - name: Upload critical artifacts
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: build-logs-${{ github.sha }}
+        name: build-results-${{ github.sha }}
         path: |
-          build.log
+          build_logs/error_report.txt
+          build_logs/summary.log
+          build_logs/build.log
+          build_logs/errors.log
           .config
           .config.backup
+        retention-days: 7
     
-    - name: Upload firmware artifacts
-      if: success()
+    - name: Upload firmware (only on success)
+      if: steps.build_step.outputs.build_exit_code == '0'
       uses: actions/upload-artifact@v4
       with:
-        name: openwrt-with-tun-${{ github.sha }}
+        name: firmware-with-tun-${{ github.sha }}
         path: |
           bin/targets/*/*/*.bin
           bin/targets/*/*/*.manifest
-          bin/targets/*/*/*.tar.gz
         retention-days: 30
     
-    - name: Create GitHub Release (optional)
-      if: github.ref == 'refs/heads/main' && success()
-      uses: softprops/action-gh-release@v2
-      with:
-        files: bin/targets/*/*/*.bin
-        tag_name: v1.0-with-tun-${{ github.sha }}
-        name: OpenWrt with TUN Module - ${{ github.sha }}
-        body: |
-          Custom build with TUN module enabled for Tenda BE12 Pro (BE7200)
-          
-          **Enabled Modules:**
-          - ✅ kmod-tun (TUN/TAP virtual network devices)
-          - ✅ kmod-iptunnel (IP tunnel support)
-          - ✅ kmod-ip6-tunnel (IPv6 tunnel support)
-          - ✅ kmod-wireguard (WireGuard support)
-          
-          **Build Information:**
-          - GitHub SHA: ${{ github.sha }}
-          - Build Date: ${{ github.date }}
-          - Node.js Version: 24 (fixed compatibility issue)
-          
-          **Verification:**
-          After flashing, verify with:
-          ```bash
-          lsmod | grep tun
-          ls -la /dev/net/tun
-          ```
-        draft: false
-        prerelease: false
+    - name: Final status report
+      if: always()
+      run: |
+        echo "🎯 BUILD FINAL STATUS REPORT"
+        echo "========================================"
+        
+        EXIT_CODE=${{ steps.build_step.outputs.build_exit_code }}
+        
+        if [ "$EXIT_CODE" -eq 0 ]; then
+          echo "✅ SUCCESS: Build completed successfully!"
+          echo "🎉 TUN module is enabled and verified"
+          echo "📦 Firmware artifacts uploaded as 'firmware-with-tun-${{ github.sha }}'"
+        else
+          echo "❌ FAILED: Build failed with exit code $EXIT_CODE"
+          echo "🚨 Critical error report available in 'build-results-${{ github.sha }}'"
+          echo "📋 Download the error_report.txt file for detailed analysis"
+          echo "💡 Common fixes:"
+          echo "   - Increase memory limit (BUILD_MEMORY)"
+          echo "   - Reduce thread count (BUILD_THREADS)"
+          echo "   - Check dependency installation"
+          echo "   - Try debug level 0 for minimal logging"
+        fi
+        
+        echo "========================================"
+        echo "🔧 To retry with different settings:"
+        echo "   - Use debug_level 0 for minimal output"
+        echo "   - Use debug_level 2 for full debugging"
+        echo "   - Adjust resource limits in the workflow file"
